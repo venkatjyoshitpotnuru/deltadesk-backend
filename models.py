@@ -2,6 +2,8 @@ from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from database import Base
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
+
 
 
 class User(Base):
@@ -17,6 +19,8 @@ class User(Base):
 
     sources = relationship("Source", back_populates="owner")
     hashed_password = Column(String, nullable=True)
+    google_refresh_token = Column(String, nullable=True)
+    gmail_connected = Column(Boolean, nullable=False, default=False)
 
 
 class Source(Base):

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException
-
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import engine, SessionLocal, Base
@@ -11,6 +12,7 @@ from bs4 import BeautifulSoup
 import difflib
 import json
 import os
+import urllib.parse
 import models
 from auth import hash_password, verify_password, create_access_token, decode_access_token
 
@@ -25,10 +27,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
 security_scheme = HTTPBearer()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_REDIRECT_URI = "http://localhost:8000/auth/google/callback"
 
 
 def get_db():
@@ -124,6 +128,51 @@ def update_me(
     db.refresh(current_user)
     return current_user
 
+
+@app.get("/auth/google/login")
+def google_login(current_user: models.User = Depends(get_current_user)):
+    params = {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/gmail.readonly",
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": str(current_user.id),
+    }
+    auth_url = f"{GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}"
+    return {"auth_url": auth_url}
+
+
+@app.get("/auth/google/callback")
+def google_callback(code: str, state: str, db: Session = Depends(get_db)):
+    token_response = requests.post(GOOGLE_TOKEN_URL, data={
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+    })
+    token_data = token_response.json()
+    print("Token exchange response:", token_data)
+
+    if "refresh_token" not in token_data:
+        return {"error": "No refresh token received", "details": token_data}
+
+    user_id = int(state)
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    print(f"Looking up user_id={user_id}, found: {user}")
+
+    if not user:
+        return {"error": f"No user found with id {user_id}. State value may not match a real user."}
+
+    user.google_refresh_token = token_data["refresh_token"]
+    user.gmail_connected = True
+    db.commit()
+    db.refresh(user)
+    print(f"Updated user {user.id}: gmail_connected={user.gmail_connected}")
+
+    return RedirectResponse(url="http://localhost:3000/profile?gmail=connected")
 
 @app.get("/sources")
 def get_sources(
