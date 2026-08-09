@@ -507,6 +507,10 @@ def check_email_watches_for_user(user: models.User, db: Session):
         if watch.keywords:
             keyword_list = [k.strip().lower() for k in watch.keywords.split(",") if k.strip()]
 
+        sender_list = []
+        if watch.sender_filter:
+            sender_list = [s.strip().lower() for s in watch.sender_filter.split(",") if s.strip()]
+
         for msg in messages:
             already_seen = (
                 db.query(models.EmailMatch)
@@ -519,9 +523,7 @@ def check_email_watches_for_user(user: models.User, db: Session):
             if already_seen:
                 continue
 
-            sender_matches = bool(
-                watch.sender_filter and watch.sender_filter.lower() in msg["sender"].lower()
-            )
+            sender_matches = any(s in msg["sender"].lower() for s in sender_list)
             text = f"{msg['subject']} {msg['snippet']}".lower()
             keyword_matches = any(kw in text for kw in keyword_list)
 
