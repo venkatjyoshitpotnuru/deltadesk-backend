@@ -261,6 +261,11 @@ def scheduled_check_all_sources():
         for source in sources:
             perform_check(source.id, db)
         print(f"Scheduled check completed for {len(sources)} sources.")
+
+        users_with_gmail = db.query(models.User).filter(models.User.gmail_connected == True).all()
+        for user in users_with_gmail:
+            check_email_watches_for_user(user, db)
+        print(f"Scheduled email check completed for {len(users_with_gmail)} Gmail-connected users.")
     finally:
         db.close()
 
@@ -397,3 +402,207 @@ Respond with ONLY valid JSON, no other text, in exactly this shape:
         "explanation": result.get("explanation"),
         "confidence": result.get("confidence"),
     }
+
+GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
+
+
+def get_fresh_access_token(refresh_token: str) -> str:
+    response = requests.post(GOOGLE_TOKEN_URL, data={
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    })
+    data = response.json()
+    if "access_token" not in data:
+        raise HTTPException(status_code=401, detail=f"Failed to refresh Google token: {data}")
+    return data["access_token"]
+
+
+@app.get("/gmail/messages")
+def get_gmail_messages(current_user: models.User = Depends(get_current_user)):
+    if not current_user.gmail_connected or not current_user.google_refresh_token:
+        raise HTTPException(status_code=400, detail="Gmail is not connected for this user")
+
+    access_token = get_fresh_access_token(current_user.google_refresh_token)
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    list_response = requests.get(
+        f"{GMAIL_API_BASE}/users/me/messages",
+        headers=headers,
+        params={"maxResults": 5},
+    )
+    message_ids = [m["id"] for m in list_response.json().get("messages", [])]
+
+    messages = []
+    for mid in message_ids:
+        detail_response = requests.get(
+            f"{GMAIL_API_BASE}/users/me/messages/{mid}",
+            headers=headers,
+            params={"format": "metadata", "metadataHeaders": "Subject"},
+        )
+        detail = detail_response.json()
+        headers_list = detail.get("payload", {}).get("headers", [])
+        subject = next((h["value"] for h in headers_list if h["name"] == "Subject"), "(no subject)")
+        messages.append({
+            "id": mid,
+            "subject": subject,
+            "snippet": detail.get("snippet", ""),
+        })
+
+    return {"messages": messages}
+
+class EmailWatchInput(BaseModel):
+    sender_filter: str | None = None
+    keywords: str | None = None
+
+
+def fetch_recent_gmail_messages(access_token: str, max_results: int = 15):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    list_response = requests.get(
+        f"{GMAIL_API_BASE}/users/me/messages",
+        headers=headers,
+        params={"maxResults": max_results},
+    )
+    message_ids = [m["id"] for m in list_response.json().get("messages", [])]
+
+    results = []
+    for mid in message_ids:
+        detail_response = requests.get(
+            f"{GMAIL_API_BASE}/users/me/messages/{mid}",
+            headers=headers,
+            params={"format": "metadata", "metadataHeaders": ["Subject", "From"]},
+        )
+        detail = detail_response.json()
+        headers_list = detail.get("payload", {}).get("headers", [])
+        subject = next((h["value"] for h in headers_list if h["name"] == "Subject"), "")
+        sender = next((h["value"] for h in headers_list if h["name"] == "From"), "")
+        results.append({
+            "id": mid,
+            "subject": subject,
+            "sender": sender,
+            "snippet": detail.get("snippet", ""),
+        })
+    return results
+
+
+def check_email_watches_for_user(user: models.User, db: Session):
+    if not user.gmail_connected or not user.google_refresh_token:
+        return
+
+    watches = db.query(models.EmailWatch).filter(models.EmailWatch.user_id == user.id).all()
+    if not watches:
+        return
+
+    try:
+        access_token = get_fresh_access_token(user.google_refresh_token)
+    except Exception as e:
+        print(f"Failed to refresh Gmail token for user {user.id}: {e}")
+        return
+
+    messages = fetch_recent_gmail_messages(access_token)
+
+    for watch in watches:
+        keyword_list = []
+        if watch.keywords:
+            keyword_list = [k.strip().lower() for k in watch.keywords.split(",") if k.strip()]
+
+        for msg in messages:
+            already_seen = (
+                db.query(models.EmailMatch)
+                .filter(
+                    models.EmailMatch.watch_id == watch.id,
+                    models.EmailMatch.gmail_message_id == msg["id"],
+                )
+                .first()
+            )
+            if already_seen:
+                continue
+
+            sender_matches = bool(
+                watch.sender_filter and watch.sender_filter.lower() in msg["sender"].lower()
+            )
+            text = f"{msg['subject']} {msg['snippet']}".lower()
+            keyword_matches = any(kw in text for kw in keyword_list)
+
+            if sender_matches or keyword_matches:
+                new_match = models.EmailMatch(
+                    watch_id=watch.id,
+                    gmail_message_id=msg["id"],
+                    sender=msg["sender"],
+                    subject=msg["subject"],
+                    snippet=msg["snippet"],
+                )
+                db.add(new_match)
+
+    db.commit()
+
+
+@app.post("/email-watches")
+def create_email_watch(
+    data: EmailWatchInput,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if not data.sender_filter and not data.keywords:
+        raise HTTPException(status_code=400, detail="Provide a sender, keywords, or both")
+
+    new_watch = models.EmailWatch(
+        user_id=current_user.id,
+        sender_filter=data.sender_filter,
+        keywords=data.keywords,
+    )
+    db.add(new_watch)
+    db.commit()
+    db.refresh(new_watch)
+    return new_watch
+
+
+@app.get("/email-watches")
+def list_email_watches(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return db.query(models.EmailWatch).filter(models.EmailWatch.user_id == current_user.id).all()
+
+
+@app.delete("/email-watches/{watch_id}")
+def delete_email_watch(
+    watch_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    watch = (
+        db.query(models.EmailWatch)
+        .filter(models.EmailWatch.id == watch_id, models.EmailWatch.user_id == current_user.id)
+        .first()
+    )
+    if not watch:
+        raise HTTPException(status_code=404, detail="Watch not found")
+
+    db.query(models.EmailMatch).filter(models.EmailMatch.watch_id == watch_id).delete()
+    db.delete(watch)
+    db.commit()
+    return {"message": "deleted"}
+
+
+@app.get("/email-watches/{watch_id}/matches")
+def get_email_matches(
+    watch_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    watch = (
+        db.query(models.EmailWatch)
+        .filter(models.EmailWatch.id == watch_id, models.EmailWatch.user_id == current_user.id)
+        .first()
+    )
+    if not watch:
+        raise HTTPException(status_code=404, detail="Watch not found")
+
+    return (
+        db.query(models.EmailMatch)
+        .filter(models.EmailMatch.watch_id == watch_id)
+        .order_by(models.EmailMatch.matched_at.desc())
+        .all()
+    )

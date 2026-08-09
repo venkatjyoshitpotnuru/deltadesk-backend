@@ -41,3 +41,25 @@ class Snapshot(Base):
     source_id = Column(Integer, ForeignKey("sources.id"), nullable=False)
     content = Column(String, nullable=False)
     captured_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class EmailWatch(Base):
+    __tablename__ = "email_watches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    sender_filter = Column(String, nullable=True)
+    keywords = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class EmailMatch(Base):
+    __tablename__ = "email_matches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    watch_id = Column(Integer, ForeignKey("email_watches.id"), nullable=False)
+    gmail_message_id = Column(String, nullable=False)
+    sender = Column(String, nullable=True)
+    subject = Column(String, nullable=True)
+    snippet = Column(String, nullable=True)
+    matched_at = Column(DateTime(timezone=True), server_default=func.now())
