@@ -1,17 +1,18 @@
 from fastapi import FastAPI, Depends, HTTPException
+
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import engine, SessionLocal, Base
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
+from groq import Groq
 import requests
 from bs4 import BeautifulSoup
 import difflib
-import models
-from groq import Groq
 import json
 import os
-
+import models
+from auth import hash_password, verify_password, create_access_token, decode_access_token
 
 Base.metadata.create_all(bind=engine)
 
@@ -24,6 +25,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+security_scheme = HTTPBearer()
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
 
 def get_db():
     db = SessionLocal()
@@ -33,13 +39,32 @@ def get_db():
         db.close()
 
 
-class SourceInput(BaseModel):
-    url: str
-    category: str
-    user_id: int
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
+    db: Session = Depends(get_db),
+):
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = db.query(models.User).filter(models.User.id == payload.get("user_id")).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
 
 
-class UserInput(BaseModel):
+class SignupInput(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class LoginInput(BaseModel):
+    email: str
+    password: str
+
+
+class ProfileUpdateInput(BaseModel):
     name: str
     email: str
     education_level: str | None = None
@@ -48,13 +73,123 @@ class UserInput(BaseModel):
     goals: str | None = None
 
 
+class SourceInput(BaseModel):
+    url: str
+    category: str
+
+
+@app.post("/signup")
+def signup(data: SignupInput, db: Session = Depends(get_db)):
+    existing = db.query(models.User).filter(models.User.email == data.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    new_user = models.User(
+        name=data.name,
+        email=data.email,
+        hashed_password=hash_password(data.password),
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    token = create_access_token({"user_id": new_user.id})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/login")
+def login(data: LoginInput, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == data.email).first()
+    if not user or not user.hashed_password or not verify_password(data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_access_token({"user_id": user.id})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/users/me")
+def get_me(current_user: models.User = Depends(get_current_user)):
+    return current_user
+
+
+@app.put("/users/me")
+def update_me(
+    data: ProfileUpdateInput,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    for key, value in data.model_dump().items():
+        setattr(current_user, key, value)
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@app.get("/sources")
+def get_sources(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return db.query(models.Source).filter(models.Source.user_id == current_user.id).all()
+
+
+@app.post("/sources")
+def add_source(
+    source: SourceInput,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    new_source = models.Source(
+        url=source.url,
+        category=source.category,
+        user_id=current_user.id,
+    )
+    db.add(new_source)
+    db.commit()
+    db.refresh(new_source)
+    return new_source
+
+
+@app.get("/sources/{source_id}")
+def get_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return source
+
+
+@app.delete("/sources/{source_id}")
+def delete_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    db.query(models.Snapshot).filter(models.Snapshot.source_id == source_id).delete()
+    db.delete(source)
+    db.commit()
+    return {"message": "deleted"}
+
+
 def perform_check(source_id: int, db: Session):
-    """Fetch a source's URL, extract text, save it as a new snapshot.
-    Used by both the manual /check endpoint and the scheduled job."""
     source = db.query(models.Source).filter(models.Source.id == source_id).first()
     if not source:
         return None
-
     try:
         response = requests.get(source.url, timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
@@ -71,8 +206,6 @@ def perform_check(source_id: int, db: Session):
 
 
 def scheduled_check_all_sources():
-    """Runs automatically on a timer. Opens its own DB session,
-    since no HTTP request is happening to provide one via Depends(get_db)."""
     db = SessionLocal()
     try:
         sources = db.query(models.Source).all()
@@ -92,54 +225,40 @@ def start_scheduler():
     scheduler.start()
 
 
-@app.get("/sources")
-def get_sources(db: Session = Depends(get_db)):
-    return db.query(models.Source).all()
-
-
-@app.post("/sources")
-def add_source(source: SourceInput, db: Session = Depends(get_db)):
-    new_source = models.Source(
-        url=source.url,
-        category=source.category,
-        user_id=source.user_id,
-    )
-    db.add(new_source)
-    db.commit()
-    db.refresh(new_source)
-    return new_source
-
-
-@app.get("/sources/{source_id}")
-def get_source(source_id: int, db: Session = Depends(get_db)):
-    source = db.query(models.Source).filter(models.Source.id == source_id).first()
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
-    return source
-
-
-@app.delete("/sources/{source_id}")
-def delete_source(source_id: int, db: Session = Depends(get_db)):
-    source = db.query(models.Source).filter(models.Source.id == source_id).first()
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    db.query(models.Snapshot).filter(models.Snapshot.source_id == source_id).delete()
-    db.delete(source)
-    db.commit()
-    return {"message": "deleted"}
-
-
 @app.post("/sources/{source_id}/check")
-def check_source(source_id: int, db: Session = Depends(get_db)):
+def check_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
     snapshot = perform_check(source_id, db)
     if not snapshot:
-        raise HTTPException(status_code=404, detail="Source not found or fetch failed")
+        raise HTTPException(status_code=404, detail="Fetch failed")
     return {"message": "snapshot saved", "snapshot_id": snapshot.id, "length": len(snapshot.content)}
 
 
 @app.get("/sources/{source_id}/changes")
-def get_changes(source_id: int, db: Session = Depends(get_db)):
+def get_changes(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
     snapshots = (
         db.query(models.Snapshot)
         .filter(models.Snapshot.source_id == source_id)
@@ -147,21 +266,14 @@ def get_changes(source_id: int, db: Session = Depends(get_db)):
         .limit(2)
         .all()
     )
-
     if len(snapshots) < 2:
         return {"message": "Not enough snapshots yet. Call /check at least twice."}
 
     newer, older = snapshots[0], snapshots[1]
-
     if newer.content == older.content:
         return {"changed": False, "message": "No change detected."}
 
-    diff = list(difflib.unified_diff(
-        older.content.split(),
-        newer.content.split(),
-        lineterm=""
-    ))
-
+    diff = list(difflib.unified_diff(older.content.split(), newer.content.split(), lineterm=""))
     return {
         "changed": True,
         "previous_captured_at": older.captured_at,
@@ -170,50 +282,19 @@ def get_changes(source_id: int, db: Session = Depends(get_db)):
     }
 
 
-@app.post("/users")
-def add_user(user: UserInput, db: Session = Depends(get_db)):
-    new_user = models.User(**user.model_dump())
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    return new_user
-
-
-@app.get("/users/{user_id}")
-def get_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
-
-
-@app.put("/users/{user_id}")
-def update_user(user_id: int, user: UserInput, db: Session = Depends(get_db)):
-    existing = db.query(models.User).filter(models.User.id == user_id).first()
-    if not existing:
-        raise HTTPException(status_code=404, detail="User not found")
-    for key, value in user.model_dump().items():
-        setattr(existing, key, value)
-    db.commit()
-    db.refresh(existing)
-    return existing
-
-
-@app.get("/users/{user_id}/sources")
-def get_user_sources(user_id: int, db: Session = Depends(get_db)):
-    return db.query(models.Source).filter(models.Source.user_id == user_id).all()
-
-
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-
 @app.get("/sources/{source_id}/impact")
-def get_impact(source_id: int, db: Session = Depends(get_db)):
-    source = db.query(models.Source).filter(models.Source.id == source_id).first()
+def get_impact(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
-
-    user = db.query(models.User).filter(models.User.id == source.user_id).first()
 
     snapshots = (
         db.query(models.Snapshot)
@@ -222,25 +303,20 @@ def get_impact(source_id: int, db: Session = Depends(get_db)):
         .limit(2)
         .all()
     )
-
     if len(snapshots) < 2:
         return {"message": "Not enough snapshots yet. Check this source at least twice first."}
 
     newer, older = snapshots[0], snapshots[1]
-
     if newer.content == older.content:
         return {"changed": False, "message": "No change detected, nothing to assess."}
 
-    diff = list(difflib.unified_diff(
-        older.content.split(), newer.content.split(), lineterm=""
-    ))
-    diff_text = "\n".join(diff)
+    diff_text = "\n".join(difflib.unified_diff(older.content.split(), newer.content.split(), lineterm=""))
 
     profile_summary = f"""
-Education level: {user.education_level or "not specified"}
-Branch: {user.branch or "not specified"}
-Graduation year: {user.graduation_year or "not specified"}
-Goals: {user.goals or "not specified"}
+Education level: {current_user.education_level or "not specified"}
+Branch: {current_user.branch or "not specified"}
+Graduation year: {current_user.graduation_year or "not specified"}
+Goals: {current_user.goals or "not specified"}
 """
 
     prompt = f"""You are analyzing a detected change on a webpage for a specific user, to decide if it's relevant to them.
@@ -259,7 +335,6 @@ Respond with ONLY valid JSON, no other text, in exactly this shape:
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
-
     raw_text = response.choices[0].message.content
 
     try:

@@ -16,6 +16,7 @@ class User(Base):
     goals = Column(String, nullable=True)
 
     sources = relationship("Source", back_populates="owner")
+    hashed_password = Column(String, nullable=True)
 
 
 class Source(Base):
