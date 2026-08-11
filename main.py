@@ -15,6 +15,9 @@ import os
 import urllib.parse
 import models
 from auth import hash_password, verify_password, create_access_token, decode_access_token
+import pdfplumber
+from fastapi import UploadFile, File, Form
+import uuid
 
 Base.metadata.create_all(bind=engine)
 
@@ -179,8 +182,12 @@ def get_sources(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    return db.query(models.Source).filter(models.Source.user_id == current_user.id).all()
-
+    return (
+        db.query(models.Source)
+        .filter(models.Source.user_id == current_user.id)
+        .order_by(models.Source.created_at.desc())
+        .all()
+    )
 
 @app.post("/sources")
 def add_source(
@@ -257,9 +264,23 @@ def perform_check(source_id: int, db: Session):
 def scheduled_check_all_sources():
     db = SessionLocal()
     try:
-        sources = db.query(models.Source).all()
+        sources = db.query(models.Source).filter(models.Source.file_path.is_(None)).all()
         for source in sources:
-            perform_check(source.id, db)
+            snapshots_before = (
+                db.query(models.Snapshot)
+                .filter(models.Snapshot.source_id == source.id)
+                .order_by(models.Snapshot.captured_at.desc())
+                .first()
+            )
+            new_snapshot = perform_check(source.id, db)
+            if new_snapshot and snapshots_before and new_snapshot.content != snapshots_before.content:
+                owner = db.query(models.User).filter(models.User.id == source.user_id).first()
+                if owner:
+                    run_impact_assessment(
+                        source.id, new_snapshot.id,
+                        snapshots_before.content, new_snapshot.content,
+                        owner, db,
+                    )
         print(f"Scheduled check completed for {len(sources)} sources.")
 
         users_with_gmail = db.query(models.User).filter(models.User.gmail_connected == True).all()
@@ -608,3 +629,218 @@ def get_email_matches(
         .order_by(models.EmailMatch.matched_at.desc())
         .all()
     )
+
+
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def extract_pdf_text(file_path: str) -> str:
+    text_parts = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    return "\n".join(text_parts)
+
+
+@app.post("/sources/upload")
+def upload_pdf_source(
+    file: UploadFile = File(...),
+    category: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    unique_name = f"{uuid.uuid4().hex}_{file.filename}"
+    saved_path = os.path.join(UPLOAD_DIR, unique_name)
+
+    with open(saved_path, "wb") as f:
+        f.write(file.file.read())
+
+    extracted_text = extract_pdf_text(saved_path)
+    if not extracted_text.strip():
+        os.remove(saved_path)
+        raise HTTPException(status_code=400, detail="Could not extract text from this PDF (it may be a scanned image)")
+
+    new_source = models.Source(
+        url=file.filename,
+        category=category,
+        user_id=current_user.id,
+        file_path=saved_path,
+    )
+    db.add(new_source)
+    db.commit()
+    db.refresh(new_source)
+
+    first_snapshot = models.Snapshot(source_id=new_source.id, content=extracted_text)
+    db.add(first_snapshot)
+    db.commit()
+    db.refresh(new_source)
+
+    return new_source
+    return new_source
+
+def perform_check(source_id: int, db: Session):
+    source = db.query(models.Source).filter(models.Source.id == source_id).first()
+    if not source:
+        return None
+    try:
+        if source.url.lower().endswith(".pdf"):
+            response = requests.get(source.url, timeout=15)
+            temp_path = os.path.join(UPLOAD_DIR, f"temp_{source_id}.pdf")
+            with open(temp_path, "wb") as f:
+                f.write(response.content)
+            current_text = extract_pdf_text(temp_path)
+            os.remove(temp_path)
+        else:
+            response = requests.get(source.url, timeout=10)
+            soup = BeautifulSoup(response.text, "html.parser")
+            current_text = soup.get_text(separator=" ", strip=True)
+
+        new_snapshot = models.Snapshot(source_id=source_id, content=current_text)
+        db.add(new_snapshot)
+        db.commit()
+        db.refresh(new_snapshot)
+        return new_snapshot
+    except Exception as e:
+        print(f"Failed to check source {source_id}: {e}")
+        return None
+
+
+@app.post("/sources/{source_id}/reupload")
+def reupload_pdf_source(
+    source_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if not source.file_path:
+        raise HTTPException(status_code=400, detail="This source isn't a PDF upload")
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    unique_name = f"{uuid.uuid4().hex}_{file.filename}"
+    saved_path = os.path.join(UPLOAD_DIR, unique_name)
+    with open(saved_path, "wb") as f:
+        f.write(file.file.read())
+
+    extracted_text = extract_pdf_text(saved_path)
+    if not extracted_text.strip():
+        os.remove(saved_path)
+        raise HTTPException(status_code=400, detail="Could not extract text from this PDF")
+
+    old_path = source.file_path
+    source.file_path = saved_path
+    source.url = file.filename
+    db.commit()
+
+    if old_path and os.path.exists(old_path):
+        os.remove(old_path)
+
+    new_snapshot = models.Snapshot(source_id=source_id, content=extracted_text)
+    db.add(new_snapshot)
+    db.commit()
+    db.refresh(new_snapshot)
+
+    return {"message": "new version uploaded", "snapshot_id": new_snapshot.id}
+
+def run_impact_assessment(source_id: int, snapshot_id: int, older_content: str, newer_content: str, user: models.User, db: Session):
+    diff_text = "\n".join(difflib.unified_diff(older_content.split(), newer_content.split(), lineterm=""))
+
+    profile_summary = f"""
+Education level: {user.education_level or "not specified"}
+Branch: {user.branch or "not specified"}
+Graduation year: {user.graduation_year or "not specified"}
+Goals: {user.goals or "not specified"}
+"""
+
+    prompt = f"""You are analyzing a detected change on a webpage for a specific user, to decide if it's relevant to them.
+
+User profile:
+{profile_summary}
+
+Detected change (diff format, + means added, - means removed):
+{diff_text}
+
+Respond with ONLY valid JSON, no other text, in exactly this shape:
+{{"category": "one of: Urgent action needed, New opportunity, Eligibility may have changed, Deadline changed, Requirement changed, Information only, Low-confidence possible relevance", "explanation": "one or two sentences explaining why, referencing the user's specific profile details", "confidence": a number between 0 and 1}}"""
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"Impact assessment failed for source {source_id}: {e}")
+        return
+
+    new_assessment = models.Assessment(
+        source_id=source_id,
+        snapshot_id=snapshot_id,
+        category=result.get("category"),
+        explanation=result.get("explanation"),
+        confidence=str(result.get("confidence")),
+    )
+    db.add(new_assessment)
+    db.commit()
+
+@app.get("/activity")
+def get_activity(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    assessments = (
+        db.query(models.Assessment)
+        .join(models.Source, models.Assessment.source_id == models.Source.id)
+        .filter(models.Source.user_id == current_user.id)
+        .order_by(models.Assessment.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+    watch_ids = [w.id for w in db.query(models.EmailWatch).filter(models.EmailWatch.user_id == current_user.id).all()]
+    email_matches = (
+        db.query(models.EmailMatch)
+        .filter(models.EmailMatch.watch_id.in_(watch_ids))
+        .order_by(models.EmailMatch.matched_at.desc())
+        .limit(20)
+        .all()
+    ) if watch_ids else []
+
+    activity = []
+    for a in assessments:
+        source = db.query(models.Source).filter(models.Source.id == a.source_id).first()
+        activity.append({
+            "type": "source_change",
+            "timestamp": a.created_at,
+            "title": source.url if source else "Unknown source",
+            "category": a.category,
+            "explanation": a.explanation,
+            "confidence": a.confidence,
+        })
+
+    for m in email_matches:
+        activity.append({
+            "type": "email_match",
+            "timestamp": m.matched_at,
+            "title": m.subject or "(no subject)",
+            "sender": m.sender,
+            "snippet": m.snippet,
+        })
+
+    activity.sort(key=lambda x: x["timestamp"], reverse=True)
+    return activity[:25]

@@ -1,9 +1,7 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from database import Base
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
-
 
 
 class User(Base):
@@ -16,11 +14,11 @@ class User(Base):
     branch = Column(String, nullable=True)
     graduation_year = Column(Integer, nullable=True)
     goals = Column(String, nullable=True)
-
-    sources = relationship("Source", back_populates="owner")
     hashed_password = Column(String, nullable=True)
     google_refresh_token = Column(String, nullable=True)
     gmail_connected = Column(Boolean, nullable=False, default=False)
+
+    sources = relationship("Source", back_populates="owner")
 
 
 class Source(Base):
@@ -31,8 +29,10 @@ class Source(Base):
     category = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    file_path = Column(String, nullable=True)
 
     owner = relationship("User", back_populates="sources")
+
 
 class Snapshot(Base):
     __tablename__ = "snapshots"
@@ -63,3 +63,14 @@ class EmailMatch(Base):
     subject = Column(String, nullable=True)
     snippet = Column(String, nullable=True)
     matched_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_id = Column(Integer, ForeignKey("sources.id"), nullable=False)
+    snapshot_id = Column(Integer, ForeignKey("snapshots.id"), nullable=False)
+    category = Column(String, nullable=True)
+    explanation = Column(String, nullable=True)
+    confidence = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
