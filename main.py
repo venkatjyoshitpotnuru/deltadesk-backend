@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -10,14 +10,14 @@ from groq import Groq
 import requests
 from bs4 import BeautifulSoup
 import difflib
+from difflib import SequenceMatcher
+import pdfplumber
 import json
 import os
+import uuid
 import urllib.parse
 import models
 from auth import hash_password, verify_password, create_access_token, decode_access_token
-import pdfplumber
-from fastapi import UploadFile, File, Form
-import uuid
 
 Base.metadata.create_all(bind=engine)
 
@@ -36,6 +36,10 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_REDIRECT_URI = "http://localhost:8000/auth/google/callback"
+GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def get_db():
@@ -85,6 +89,30 @@ class SourceInput(BaseModel):
     category: str
 
 
+class EmailWatchInput(BaseModel):
+    sender_filter: str | None = None
+    keywords: str | None = None
+
+
+def is_meaningful_change(old_text: str, new_text: str, threshold: float = 0.985) -> bool:
+    if old_text == new_text:
+        return False
+    ratio = SequenceMatcher(None, old_text, new_text).ratio()
+    return ratio < threshold
+
+
+def extract_pdf_text(file_path: str) -> str:
+    text_parts = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    return "\n".join(text_parts)
+
+
+# ---------- Auth ----------
+
 @app.post("/signup")
 def signup(data: SignupInput, db: Session = Depends(get_db)):
     existing = db.query(models.User).filter(models.User.email == data.email).first()
@@ -132,6 +160,8 @@ def update_me(
     return current_user
 
 
+# ---------- Google OAuth / Gmail ----------
+
 @app.get("/auth/google/login")
 def google_login(current_user: models.User = Depends(get_current_user)):
     params = {
@@ -164,267 +194,15 @@ def google_callback(code: str, state: str, db: Session = Depends(get_db)):
 
     user_id = int(state)
     user = db.query(models.User).filter(models.User.id == user_id).first()
-    print(f"Looking up user_id={user_id}, found: {user}")
-
     if not user:
-        return {"error": f"No user found with id {user_id}. State value may not match a real user."}
+        return {"error": f"No user found with id {user_id}"}
 
     user.google_refresh_token = token_data["refresh_token"]
     user.gmail_connected = True
     db.commit()
     db.refresh(user)
-    print(f"Updated user {user.id}: gmail_connected={user.gmail_connected}")
 
     return RedirectResponse(url="http://localhost:3000/profile?gmail=connected")
-
-@app.get("/sources")
-def get_sources(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    return (
-        db.query(models.Source)
-        .filter(models.Source.user_id == current_user.id)
-        .order_by(models.Source.created_at.desc())
-        .all()
-    )
-
-@app.post("/sources")
-def add_source(
-    source: SourceInput,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    new_source = models.Source(
-        url=source.url,
-        category=source.category,
-        user_id=current_user.id,
-    )
-    db.add(new_source)
-    db.commit()
-    db.refresh(new_source)
-    return new_source
-
-
-@app.get("/sources/{source_id}")
-def get_source(
-    source_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    source = (
-        db.query(models.Source)
-        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
-        .first()
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
-    return source
-
-
-@app.delete("/sources/{source_id}")
-def delete_source(
-    source_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    source = (
-        db.query(models.Source)
-        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
-        .first()
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    db.query(models.Snapshot).filter(models.Snapshot.source_id == source_id).delete()
-    db.delete(source)
-    db.commit()
-    return {"message": "deleted"}
-
-
-def perform_check(source_id: int, db: Session):
-    source = db.query(models.Source).filter(models.Source.id == source_id).first()
-    if not source:
-        return None
-    try:
-        response = requests.get(source.url, timeout=10)
-        soup = BeautifulSoup(response.text, "html.parser")
-        current_text = soup.get_text(separator=" ", strip=True)
-
-        new_snapshot = models.Snapshot(source_id=source_id, content=current_text)
-        db.add(new_snapshot)
-        db.commit()
-        db.refresh(new_snapshot)
-        return new_snapshot
-    except Exception as e:
-        print(f"Failed to check source {source_id}: {e}")
-        return None
-
-
-def scheduled_check_all_sources():
-    db = SessionLocal()
-    try:
-        sources = db.query(models.Source).filter(models.Source.file_path.is_(None)).all()
-        for source in sources:
-            snapshots_before = (
-                db.query(models.Snapshot)
-                .filter(models.Snapshot.source_id == source.id)
-                .order_by(models.Snapshot.captured_at.desc())
-                .first()
-            )
-            new_snapshot = perform_check(source.id, db)
-            if new_snapshot and snapshots_before and new_snapshot.content != snapshots_before.content:
-                owner = db.query(models.User).filter(models.User.id == source.user_id).first()
-                if owner:
-                    run_impact_assessment(
-                        source.id, new_snapshot.id,
-                        snapshots_before.content, new_snapshot.content,
-                        owner, db,
-                    )
-        print(f"Scheduled check completed for {len(sources)} sources.")
-
-        users_with_gmail = db.query(models.User).filter(models.User.gmail_connected == True).all()
-        for user in users_with_gmail:
-            check_email_watches_for_user(user, db)
-        print(f"Scheduled email check completed for {len(users_with_gmail)} Gmail-connected users.")
-    finally:
-        db.close()
-
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(scheduled_check_all_sources, "interval", minutes=2)
-
-
-@app.on_event("startup")
-def start_scheduler():
-    scheduler.start()
-
-
-@app.post("/sources/{source_id}/check")
-def check_source(
-    source_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    source = (
-        db.query(models.Source)
-        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
-        .first()
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    snapshot = perform_check(source_id, db)
-    if not snapshot:
-        raise HTTPException(status_code=404, detail="Fetch failed")
-    return {"message": "snapshot saved", "snapshot_id": snapshot.id, "length": len(snapshot.content)}
-
-
-@app.get("/sources/{source_id}/changes")
-def get_changes(
-    source_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    source = (
-        db.query(models.Source)
-        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
-        .first()
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    snapshots = (
-        db.query(models.Snapshot)
-        .filter(models.Snapshot.source_id == source_id)
-        .order_by(models.Snapshot.captured_at.desc())
-        .limit(2)
-        .all()
-    )
-    if len(snapshots) < 2:
-        return {"message": "Not enough snapshots yet. Call /check at least twice."}
-
-    newer, older = snapshots[0], snapshots[1]
-    if newer.content == older.content:
-        return {"changed": False, "message": "No change detected."}
-
-    diff = list(difflib.unified_diff(older.content.split(), newer.content.split(), lineterm=""))
-    return {
-        "changed": True,
-        "previous_captured_at": older.captured_at,
-        "current_captured_at": newer.captured_at,
-        "diff": diff,
-    }
-
-
-@app.get("/sources/{source_id}/impact")
-def get_impact(
-    source_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    source = (
-        db.query(models.Source)
-        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
-        .first()
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    snapshots = (
-        db.query(models.Snapshot)
-        .filter(models.Snapshot.source_id == source_id)
-        .order_by(models.Snapshot.captured_at.desc())
-        .limit(2)
-        .all()
-    )
-    if len(snapshots) < 2:
-        return {"message": "Not enough snapshots yet. Check this source at least twice first."}
-
-    newer, older = snapshots[0], snapshots[1]
-    if newer.content == older.content:
-        return {"changed": False, "message": "No change detected, nothing to assess."}
-
-    diff_text = "\n".join(difflib.unified_diff(older.content.split(), newer.content.split(), lineterm=""))
-
-    profile_summary = f"""
-Education level: {current_user.education_level or "not specified"}
-Branch: {current_user.branch or "not specified"}
-Graduation year: {current_user.graduation_year or "not specified"}
-Goals: {current_user.goals or "not specified"}
-"""
-
-    prompt = f"""You are analyzing a detected change on a webpage for a specific user, to decide if it's relevant to them.
-
-User profile:
-{profile_summary}
-
-Detected change (diff format, + means added, - means removed):
-{diff_text}
-
-Respond with ONLY valid JSON, no other text, in exactly this shape:
-{{"category": "one of: Urgent action needed, New opportunity, Eligibility may have changed, Deadline changed, Requirement changed, Information only, Low-confidence possible relevance", "explanation": "one or two sentences explaining why, referencing the user's specific profile details", "confidence": a number between 0 and 1}}"""
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw_text = response.choices[0].message.content
-
-    try:
-        result = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return {"error": "Model did not return valid JSON", "raw": raw_text}
-
-    return {
-        "changed": True,
-        "category": result.get("category"),
-        "explanation": result.get("explanation"),
-        "confidence": result.get("confidence"),
-    }
-
-GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 
 
 def get_fresh_access_token(refresh_token: str) -> str:
@@ -438,44 +216,6 @@ def get_fresh_access_token(refresh_token: str) -> str:
     if "access_token" not in data:
         raise HTTPException(status_code=401, detail=f"Failed to refresh Google token: {data}")
     return data["access_token"]
-
-
-@app.get("/gmail/messages")
-def get_gmail_messages(current_user: models.User = Depends(get_current_user)):
-    if not current_user.gmail_connected or not current_user.google_refresh_token:
-        raise HTTPException(status_code=400, detail="Gmail is not connected for this user")
-
-    access_token = get_fresh_access_token(current_user.google_refresh_token)
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    list_response = requests.get(
-        f"{GMAIL_API_BASE}/users/me/messages",
-        headers=headers,
-        params={"maxResults": 5},
-    )
-    message_ids = [m["id"] for m in list_response.json().get("messages", [])]
-
-    messages = []
-    for mid in message_ids:
-        detail_response = requests.get(
-            f"{GMAIL_API_BASE}/users/me/messages/{mid}",
-            headers=headers,
-            params={"format": "metadata", "metadataHeaders": "Subject"},
-        )
-        detail = detail_response.json()
-        headers_list = detail.get("payload", {}).get("headers", [])
-        subject = next((h["value"] for h in headers_list if h["name"] == "Subject"), "(no subject)")
-        messages.append({
-            "id": mid,
-            "subject": subject,
-            "snippet": detail.get("snippet", ""),
-        })
-
-    return {"messages": messages}
-
-class EmailWatchInput(BaseModel):
-    sender_filter: str | None = None
-    keywords: str | None = None
 
 
 def fetch_recent_gmail_messages(access_token: str, max_results: int = 15):
@@ -505,6 +245,15 @@ def fetch_recent_gmail_messages(access_token: str, max_results: int = 15):
             "snippet": detail.get("snippet", ""),
         })
     return results
+
+
+@app.get("/gmail/messages")
+def get_gmail_messages(current_user: models.User = Depends(get_current_user)):
+    if not current_user.gmail_connected or not current_user.google_refresh_token:
+        raise HTTPException(status_code=400, detail="Gmail is not connected for this user")
+    access_token = get_fresh_access_token(current_user.google_refresh_token)
+    messages = fetch_recent_gmail_messages(access_token)
+    return {"messages": messages}
 
 
 def check_email_watches_for_user(user: models.User, db: Session):
@@ -631,19 +380,73 @@ def get_email_matches(
     )
 
 
+# ---------- Sources ----------
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+@app.get("/sources")
+def get_sources(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return (
+        db.query(models.Source)
+        .filter(models.Source.user_id == current_user.id)
+        .order_by(models.Source.created_at.desc())
+        .all()
+    )
 
 
-def extract_pdf_text(file_path: str) -> str:
-    text_parts = []
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text_parts.append(page_text)
-    return "\n".join(text_parts)
+@app.post("/sources")
+def add_source(
+    source: SourceInput,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    new_source = models.Source(
+        url=source.url,
+        category=source.category,
+        user_id=current_user.id,
+    )
+    db.add(new_source)
+    db.commit()
+    db.refresh(new_source)
+    return new_source
+
+
+@app.get("/sources/{source_id}")
+def get_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return source
+
+
+@app.delete("/sources/{source_id}")
+def delete_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    db.query(models.Snapshot).filter(models.Snapshot.source_id == source_id).delete()
+    db.query(models.Assessment).filter(models.Assessment.source_id == source_id).delete()
+    db.delete(source)
+    db.commit()
+    return {"message": "deleted"}
 
 
 @app.post("/sources/upload")
@@ -683,33 +486,6 @@ def upload_pdf_source(
     db.refresh(new_source)
 
     return new_source
-    return new_source
-
-def perform_check(source_id: int, db: Session):
-    source = db.query(models.Source).filter(models.Source.id == source_id).first()
-    if not source:
-        return None
-    try:
-        if source.url.lower().endswith(".pdf"):
-            response = requests.get(source.url, timeout=15)
-            temp_path = os.path.join(UPLOAD_DIR, f"temp_{source_id}.pdf")
-            with open(temp_path, "wb") as f:
-                f.write(response.content)
-            current_text = extract_pdf_text(temp_path)
-            os.remove(temp_path)
-        else:
-            response = requests.get(source.url, timeout=10)
-            soup = BeautifulSoup(response.text, "html.parser")
-            current_text = soup.get_text(separator=" ", strip=True)
-
-        new_snapshot = models.Snapshot(source_id=source_id, content=current_text)
-        db.add(new_snapshot)
-        db.commit()
-        db.refresh(new_snapshot)
-        return new_snapshot
-    except Exception as e:
-        print(f"Failed to check source {source_id}: {e}")
-        return None
 
 
 @app.post("/sources/{source_id}/reupload")
@@ -756,6 +532,42 @@ def reupload_pdf_source(
 
     return {"message": "new version uploaded", "snapshot_id": new_snapshot.id}
 
+
+# ---------- Change detection ----------
+
+def perform_check(source_id: int, db: Session):
+    source = db.query(models.Source).filter(models.Source.id == source_id).first()
+    if not source:
+        return None
+    try:
+        if source.url.lower().endswith(".pdf"):
+            response = requests.get(source.url, timeout=15)
+            temp_path = os.path.join(UPLOAD_DIR, f"temp_{source_id}.pdf")
+            with open(temp_path, "wb") as f:
+                f.write(response.content)
+            current_text = extract_pdf_text(temp_path)
+            os.remove(temp_path)
+        else:
+            response = requests.get(source.url, timeout=10)
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]):
+                tag.decompose()
+            for ad_element in soup.select('[class*="ad"], [id*="ad"], [class*="banner"], [class*="cookie"], [class*="popup"]'):
+                ad_element.decompose()
+
+            current_text = soup.get_text(separator=" ", strip=True)
+
+        new_snapshot = models.Snapshot(source_id=source_id, content=current_text)
+        db.add(new_snapshot)
+        db.commit()
+        db.refresh(new_snapshot)
+        return new_snapshot
+    except Exception as e:
+        print(f"Failed to check source {source_id}: {e}")
+        return None
+
+
 def run_impact_assessment(source_id: int, snapshot_id: int, older_content: str, newer_content: str, user: models.User, db: Session):
     diff_text = "\n".join(difflib.unified_diff(older_content.split(), newer_content.split(), lineterm=""))
 
@@ -797,6 +609,173 @@ Respond with ONLY valid JSON, no other text, in exactly this shape:
     )
     db.add(new_assessment)
     db.commit()
+
+
+def scheduled_check_all_sources():
+    db = SessionLocal()
+    try:
+        sources = db.query(models.Source).filter(models.Source.file_path.is_(None)).all()
+        for source in sources:
+            snapshots_before = (
+                db.query(models.Snapshot)
+                .filter(models.Snapshot.source_id == source.id)
+                .order_by(models.Snapshot.captured_at.desc())
+                .first()
+            )
+            new_snapshot = perform_check(source.id, db)
+            if new_snapshot and snapshots_before and is_meaningful_change(snapshots_before.content, new_snapshot.content):
+                owner = db.query(models.User).filter(models.User.id == source.user_id).first()
+                if owner:
+                    run_impact_assessment(
+                        source.id, new_snapshot.id,
+                        snapshots_before.content, new_snapshot.content,
+                        owner, db,
+                    )
+        print(f"Scheduled check completed for {len(sources)} sources.")
+
+        users_with_gmail = db.query(models.User).filter(models.User.gmail_connected == True).all()
+        for user in users_with_gmail:
+            check_email_watches_for_user(user, db)
+        print(f"Scheduled email check completed for {len(users_with_gmail)} Gmail-connected users.")
+    finally:
+        db.close()
+
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(scheduled_check_all_sources, "interval", minutes=2)
+
+
+@app.on_event("startup")
+def start_scheduler():
+    scheduler.start()
+
+
+@app.post("/sources/{source_id}/check")
+def check_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    snapshot = perform_check(source_id, db)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Fetch failed")
+    return {"message": "snapshot saved", "snapshot_id": snapshot.id, "length": len(snapshot.content)}
+
+
+@app.get("/sources/{source_id}/changes")
+def get_changes(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    snapshots = (
+        db.query(models.Snapshot)
+        .filter(models.Snapshot.source_id == source_id)
+        .order_by(models.Snapshot.captured_at.desc())
+        .limit(2)
+        .all()
+    )
+    if len(snapshots) < 2:
+        return {"message": "Not enough snapshots yet. Call /check at least twice."}
+
+    newer, older = snapshots[0], snapshots[1]
+    if not is_meaningful_change(older.content, newer.content):
+        return {"changed": False, "message": "No meaningful change detected."}
+
+    diff = list(difflib.unified_diff(older.content.split(), newer.content.split(), lineterm=""))
+    return {
+        "changed": True,
+        "previous_captured_at": older.captured_at,
+        "current_captured_at": newer.captured_at,
+        "diff": diff,
+    }
+
+
+@app.get("/sources/{source_id}/impact")
+def get_impact(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    source = (
+        db.query(models.Source)
+        .filter(models.Source.id == source_id, models.Source.user_id == current_user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    snapshots = (
+        db.query(models.Snapshot)
+        .filter(models.Snapshot.source_id == source_id)
+        .order_by(models.Snapshot.captured_at.desc())
+        .limit(2)
+        .all()
+    )
+    if len(snapshots) < 2:
+        return {"message": "Not enough snapshots yet. Check this source at least twice first."}
+
+    newer, older = snapshots[0], snapshots[1]
+    if not is_meaningful_change(older.content, newer.content):
+        return {"changed": False, "message": "No meaningful change detected, nothing to assess."}
+
+    diff_text = "\n".join(difflib.unified_diff(older.content.split(), newer.content.split(), lineterm=""))
+
+    profile_summary = f"""
+Education level: {current_user.education_level or "not specified"}
+Branch: {current_user.branch or "not specified"}
+Graduation year: {current_user.graduation_year or "not specified"}
+Goals: {current_user.goals or "not specified"}
+"""
+
+    prompt = f"""You are analyzing a detected change on a webpage for a specific user, to decide if it's relevant to them.
+
+User profile:
+{profile_summary}
+
+Detected change (diff format, + means added, - means removed):
+{diff_text}
+
+Respond with ONLY valid JSON, no other text, in exactly this shape:
+{{"category": "one of: Urgent action needed, New opportunity, Eligibility may have changed, Deadline changed, Requirement changed, Information only, Low-confidence possible relevance", "explanation": "one or two sentences explaining why, referencing the user's specific profile details", "confidence": a number between 0 and 1}}"""
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw_text = response.choices[0].message.content
+
+    try:
+        result = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {"error": "Model did not return valid JSON", "raw": raw_text}
+
+    return {
+        "changed": True,
+        "category": result.get("category"),
+        "explanation": result.get("explanation"),
+        "confidence": result.get("confidence"),
+    }
+
+
+# ---------- Activity feed ----------
 
 @app.get("/activity")
 def get_activity(
