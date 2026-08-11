@@ -23,9 +23,11 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[FRONTEND_URL, "http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -35,7 +37,7 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_REDIRECT_URI = "http://localhost:8000/auth/google/callback"
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 
 UPLOAD_DIR = "uploads"
@@ -202,7 +204,7 @@ def google_callback(code: str, state: str, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    return RedirectResponse(url="http://localhost:3000/profile?gmail=connected")
+    return RedirectResponse(url=f"{FRONTEND_URL}/profile?gmail=connected")
 
 
 def get_fresh_access_token(refresh_token: str) -> str:
